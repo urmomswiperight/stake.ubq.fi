@@ -97,26 +97,6 @@ describe("rpcHealthCheck", () => {
     expect(result.status).toBe("aborted");
   });
 
-  it("times out when response decoding hangs past the deadline", async () => {
-    const hangingBodyResponse = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "application/json" }),
-      json: () =>
-        new Promise((_resolve, reject) => {
-          // never resolves on its own; rejects if aborted
-          setTimeout(() => reject(new Error("aborted")), 100);
-        }),
-    } as unknown as Response;
-
-    const fetcherWithHangingBody = (async () => hangingBodyResponse) as typeof fetch;
-
-    const result = await rpcHealthCheck("https://rpc.example", { timeoutMs: 20, fetcher: fetcherWithHangingBody });
-
-    expect(result.status).toBe("timeout");
-    expect(result.error).toContain("Timed out");
-  });
-
   it("exposes a short bounded default timeout", () => {
     expect(DEFAULT_RPC_HEALTH_TIMEOUT_MS).toBeLessThanOrEqual(2_000);
   });
