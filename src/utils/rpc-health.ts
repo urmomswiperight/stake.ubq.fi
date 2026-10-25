@@ -1,123 +1,137 @@
-import { describe, expect, it } from "bun:test";
+import { parseUnits } from "viem";
 
-import { DEFAULT_RPC_HEALTH_TIMEOUT_MS, rpcHealthCheck } from "../src/utils/rpc-health";
+export type RpcHealthStatus = "healthy" | "timeout" | "aborted" | "mismatched-chain" | "invalid-url" | "rpc-error" | "unreachable";
 
-const jsonResponse = (body: unknown, status = 200): Response =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+export interface RpcHealthCheckOptions {
+  timeoutMs?: number;
+  expectedChainId?: number;
+  signal?: AbortSignal;
+  fetcher?: typeof fetch;
+}
 
-const fetcherReturning = (body: unknown, status = 200): typeof fetch => (async () => jsonResponse(body, status)) as typeof fetch;
+export interface RpcHealthCheckResult {
+  status: RpcHealthStatus;
+  rpcUrl: string;
+  latencyMs: number;
+  chainId?: number;
+  chainIdHex?: string;
+  error?: string;
+}
 
-const hangingFetcher = ((_input: RequestInfo | URL, init?: RequestInit) =>
-  new Promise<Response>((_resolve, reject) => {
-    init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-  })) as typeof fetch;
+interface RpcResponsePayload {
+  jsonrpc?: string;
+  id?: number | string | null;
+  result?: unknown;
+  error?: {
+    code?: number;
+    message?: string;
+  };
+}
 
-describe("rpcHealthCheck", () => {
-  it("returns a healthy result with the parsed chain id and latency", async () => {
-    const result = await rpcHealthCheck("https://rpc.example", {
-      expectedChainId: 1,
-      fetcher: fetcherReturning({ jsonrpc: "2.0", id: 1, result: "0x1" }),
-    });
+export const DEFAULT_RPC_HEALTH_TIMEOUT_MS = 1_500;
 
-    expect(result.status).toBe("healthy");
-    expect(result.chainId).toBe(1);
-    expect(result.chainIdHex).toBe("0x1");
-    expect(result.latencyMs).toBeGreaterThanOrEqual(0);
-  });
+function isValidRpcUrl(rpcUrl: string): boolean {
+  if (rpcUrl.startsWith("//")) return false;
+  if (rpcUrl.startsWith("/")) return true;
+  try {
+    const parsed = new URL(rpcUrl);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
-  it("detects an expectedChainId mismatch", async () => {
-    const result = await rpcHealthCheck("https://rpc.example", {
-      expectedChainId: 31337,
-      fetcher: fetcherReturning({ jsonrpc: "2.0", id: 1, result: "0x1" }),
-    });
+export function parseChainId(result: unknown): { chainId: number; chainIdHex: string } | null {
+  if (typeof result !== "string" || !result.startsWith("0x")) {
+    return null;
+  }
+  const numeric = Number.parseInt(result, 16);
+  if (!Number.isSafeInteger(numeric) || numeric <= 0) {
+    return null;
+  }
+  return { chainId: numeric, chainIdHex: result };
+}
 
-    expect(result.status).toBe("mismatched-chain");
-    expect(result.chainId).toBe(1);
-    expect(result.error).toContain("Expected chain 31337");
-  });
+export async function rpcHealthCheck(rpcUrl: string, options: RpcHealthCheckOptions = {}): Promise<RpcHealthCheckResult> {
+  const start = performance.now();
+  const elapsed = () => Math.round(performance.now() - start);
+  const { timeoutMs = DEFAULT_RPC_HEALTH_TIMEOUT_MS, expectedChainId, signal, fetcher = fetch } = options;
 
-  it("reports HTTP failures as unreachable", async () => {
-    const result = await rpcHealthCheck("https://rpc.example", { fetcher: fetcherReturning("nope", 502) });
+  if (!isValidRpcUrl(rpcUrl)) {
+    return { status: "invalid-url", rpcUrl, latencyMs: elapsed(), error: "RPC URL must be an absolute http(s) URL or a relative path" };
+  }
 
-    expect(result.status).toBe("unreachable");
-    expect(result.error).toBe("HTTP 502");
-  });
+  if (signal?.aborted) {
+    return { status: "aborted", rpcUrl, latencyMs: elapsed(), error: "Health check was aborted before it started" };
+  }
 
-  it("reports JSON-RPC error payloads", async () => {
-    const result = await rpcHealthCheck("https://rpc.example", {
-      fetcher: fetcherReturning({ jsonrpc: "2.0", id: 1, error: { message: "upstream failed" } }),
-    });
-
-    expect(result.status).toBe("rpc-error");
-    expect(result.error).toBe("upstream failed");
-  });
-
-  it("rejects invalid and protocol-relative URLs before fetching", async () => {
-    let calls = 0;
-    const fetcher = (async () => {
-      calls += 1;
-      return jsonResponse({ jsonrpc: "2.0", id: 1, result: "0x1" });
-    }) as typeof fetch;
-
-    const invalid = await rpcHealthCheck("//rpc.example", { fetcher });
-
-    expect(invalid.status).toBe("invalid-url");
-    expect(calls).toBe(0);
-  });
-
-  it("times out hanging probes", async () => {
-    const result = await rpcHealthCheck("https://rpc.example", { timeoutMs: 5, fetcher: hangingFetcher });
-
-    expect(result.status).toBe("timeout");
-    expect(result.error).toContain("Timed out");
-  });
-
-  it("honors an already-aborted caller signal without fetching", async () => {
-    let calls = 0;
-    const fetcher = (async () => {
-      calls += 1;
-      return jsonResponse({ jsonrpc: "2.0", id: 1, result: "0x1" });
-    }) as typeof fetch;
-    const controller = new AbortController();
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
     controller.abort();
+  }, timeoutMs);
+  const onCallerAbort = () => controller.abort();
+  signal?.addEventListener("abort", onCallerAbort);
 
-    const result = await rpcHealthCheck("https://rpc.example", { fetcher, signal: controller.signal });
-
-    expect(result.status).toBe("aborted");
-    expect(calls).toBe(0);
-  });
-
-  it("aborts an in-flight probe when the caller signal aborts", async () => {
-    const controller = new AbortController();
-    const pending = rpcHealthCheck("https://rpc.example", { fetcher: hangingFetcher, signal: controller.signal, timeoutMs: 5_000 });
-
-    controller.abort();
-    const result = await pending;
-
-    expect(result.status).toBe("aborted");
-  });
-
-  it("times out when response decoding hangs past the deadline", async () => {
-    const hangingBodyResponse = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "application/json" }),
-      json: () =>
-        new Promise((_resolve, reject) => {
-          // never resolves on its own; rejects if aborted
-          setTimeout(() => reject(new Error("aborted")), 100);
+  try {
+    const fetchAndDecode = async (): Promise<{ response: Response; payload?: RpcResponsePayload }> => {
+      const response = await fetcher(rpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_chainId",
+          params: [],
         }),
-    } as unknown as Response;
+        signal: controller.signal,
+      });
 
-    const fetcherWithHangingBody = (async () => hangingBodyResponse) as typeof fetch;
+      if (!response.ok) {
+        return { response };
+      }
 
-    const result = await rpcHealthCheck("https://rpc.example", { timeoutMs: 20, fetcher: fetcherWithHangingBody });
+      const payload = (await response.json()) as RpcResponsePayload;
+      return { response, payload };
+    };
 
-    expect(result.status).toBe("timeout");
-    expect(result.error).toContain("Timed out");
-  });
+    const { response, payload } = await fetchAndDecode();
 
-  it("exposes a short bounded default timeout", () => {
-    expect(DEFAULT_RPC_HEALTH_TIMEOUT_MS).toBeLessThanOrEqual(2_000);
-  });
-});
+    if (!response.ok || !payload) {
+      return { status: "unreachable", rpcUrl, latencyMs: elapsed(), error: `HTTP ${response.status}` };
+    }
+    if (payload.error) {
+      return { status: "rpc-error", rpcUrl, latencyMs: elapsed(), error: payload.error.message ?? "RPC responded with an error" };
+    }
+
+    const parsed = parseChainId(payload.result);
+    if (!parsed) {
+      return { status: "rpc-error", rpcUrl, latencyMs: elapsed(), error: "Invalid eth_chainId response" };
+    }
+
+    if (expectedChainId !== undefined && parsed.chainId !== expectedChainId) {
+      return {
+        status: "mismatched-chain",
+        rpcUrl,
+        chainId: parsed.chainId,
+        chainIdHex: parsed.chainIdHex,
+        latencyMs: elapsed(),
+        error: `Expected chain ${expectedChainId}, got ${parsed.chainId}`,
+      };
+    }
+
+    return { status: "healthy", rpcUrl, chainId: parsed.chainId, chainIdHex: parsed.chainIdHex, latencyMs: elapsed() };
+  } catch (error) {
+    const status: RpcHealthStatus = timedOut ? "timeout" : signal?.aborted ? "aborted" : "unreachable";
+    return {
+      status,
+      rpcUrl,
+      latencyMs: elapsed(),
+      error: timedOut ? `Timed out after ${timeoutMs}ms` : error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onCallerAbort);
+  }
+}
