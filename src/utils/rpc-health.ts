@@ -60,23 +60,32 @@ export async function rpcHealthCheck(rpcUrl: string, options: RpcHealthCheckOpti
   signal?.addEventListener("abort", onCallerAbort);
 
   try {
-    const response = await fetcher(rpcUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "eth_chainId",
-        params: [],
-      }),
-      signal: controller.signal,
-    });
+    const fetchAndDecode = async (): Promise<{ response: Response; payload?: RpcResponsePayload }> => {
+      const response = await fetcher(rpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_chainId",
+          params: [],
+        }),
+        signal: controller.signal,
+      });
 
-    if (!response.ok) {
+      if (!response.ok) {
+        return { response };
+      }
+
+      const payload = (await response.json()) as RpcResponsePayload;
+      return { response, payload };
+    };
+
+    const { response, payload } = await fetchAndDecode();
+
+    if (!response.ok || !payload) {
       return { status: "unreachable", rpcUrl, latencyMs: elapsed(), error: `HTTP ${response.status}` };
     }
-
-    const payload = (await response.json()) as RpcResponsePayload;
     if (payload.error) {
       return { status: "rpc-error", rpcUrl, latencyMs: elapsed(), error: payload.error.message ?? "RPC responded with an error" };
     }
